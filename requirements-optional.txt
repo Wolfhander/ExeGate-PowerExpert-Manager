@@ -1,0 +1,11 @@
+# Опциональные зависимости
+# Установить нужные командой: pip install -r requirements-optional.txt
+
+# SNMP-мониторинг по сети (вкладка SNMP)
+pysnmp>=4.4.12
+
+# USB HID подключение (альтернатива COM-порту)
+hid>=1.0.4
+
+# Сборка EXE
+pyinstaller>=5.0
