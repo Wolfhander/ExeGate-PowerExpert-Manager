@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ╔═══════════════════════════════════════════════════════════════════╗
-║       ExeGate PowerExpert UPS Manager  v1.0                       ║
+║       ExeGate PowerExpert UPS Manager  v1.1                       ║
 ║       Управление ИБП ExeGate PowerExpert TL-2000.72V              ║
 ║       Протокол: Megatec Q1 (RS232/USB)  |  Windows 11             ║
 ╚═══════════════════════════════════════════════════════════════════╝
 
 Зависимости (установить через pip):
-    pip install PyQt5 pyqtgraph pyserial
+    pip install -r requirements.txt
 
-Опциональные:
-    pip install hid          # поддержка USB HID
-    pip install pywin32      # Windows уведомления/тray
-    pip install pysnmp       # SNMP мониторинг
+Сборка Windows x64: build.bat (Python 3.14).
+SNMP: PySNMP 7, SNMPv2c, UPS MIB RFC 1628.
 
 Поддерживаемые интерфейсы:
     • RS232  — Megatec Q1 protocol (2400 baud, 8N1)
@@ -30,6 +28,11 @@ import threading
 import subprocess
 import platform
 import logging
+import copy
+import math
+import re
+from ups_snmp import SNMP_AVAILABLE, snmp_get, read_ups
+from tray_notifications import show_notification, remove_notification
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -48,7 +51,7 @@ try:
         QDoubleSpinBox, QCheckBox, QGroupBox, QTabWidget, QTableWidget,
         QTableWidgetItem, QHeaderView, QTextEdit, QLineEdit,
         QSystemTrayIcon, QMenu, QAction, QMessageBox, QFileDialog,
-        QFrame, QSplitter, QProgressBar, QSlider, QScrollArea,
+        QFrame, QSplitter, QProgressBar, QSlider, QScrollArea, QLayout,
         QSizePolicy, QDialog
     )
     from PyQt5.QtCore import (
@@ -83,23 +86,12 @@ try:
 except ImportError:
     PYQTGRAPH_AVAILABLE = False
 
-# ─── SNMP (опционально) ──────────────────────────────────────────────────────
-try:
-    from pysnmp.hlapi import (
-        getCmd, SnmpEngine, CommunityData, UdpTransportTarget,
-        ContextData, ObjectType, ObjectIdentity
-    )
-    SNMP_AVAILABLE = True
-except ImportError:
-    SNMP_AVAILABLE = False
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 #  КОНСТАНТЫ И КОНФИГУРАЦИЯ
 # ═════════════════════════════════════════════════════════════════════════════
 
 APP_NAME    = "ExeGate PowerExpert Manager"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHOR  = "UPS Monitor"
 
 # Параметры ExeGate PowerExpert TL-2000.72V
@@ -162,7 +154,7 @@ DEFAULT_CONFIG = {
         "battery_low_percent": 30,
         "delay_minutes": 5,
         "warn_before_sec": 60,
-        "command": "shutdown /s /t 60 /c \"ИБП: питание от батареи. Завершение работы.\"",
+        "command": "shutdown /s /t 0 /c \"ИБП: питание от батареи. Завершение работы.\"",
 
         # Новый триггер: завершение сразу при переходе на батарею
         "on_battery_switch": False,         # включить/выключить
@@ -1068,6 +1060,11 @@ class MegatecParser:
             if len(parts) < 8:
                 return False
 
+            values = [float(value) for value in parts[:7]]
+            if not all(math.isfinite(value) for value in values):
+                return False
+            if len(parts[7]) != 8 or set(parts[7]) - {"0", "1"}:
+                return False
             status.input_voltage   = float(parts[0])
             status.input_fault_v   = float(parts[1])
             status.output_voltage  = float(parts[2])
@@ -1162,7 +1159,11 @@ class UPSPollerThread(QThread):
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
-        self.config          = config
+        self.config          = copy.deepcopy(config)
+        self._wake = threading.Event()
+        self._device_info = UPSStatus()
+        self._temperature_alarm = False
+        self._temperature_threshold = None
         self._running        = False
         self._serial: Optional[serial.Serial] = None
         self._was_connected  = False
@@ -1179,34 +1180,33 @@ class UPSPollerThread(QThread):
 
     def run(self):
         self._running = True
-        interval = self.config["connection"]["poll_interval"] / 1000.0
-
-        # Первичное подключение
         self._connect()
-
-        while self._running:
-            start = time.monotonic()
-
-            # Принудительное переподключение по запросу из UI
-            if self._force_reconnect:
-                self._force_reconnect = False
-                self._disconnect()
-                self._demo_mode   = False
-                self._retry_count = 0
-                self._connect()
-
-            self._poll_once()
-            elapsed = time.monotonic() - start
-            sleep_t = max(0.1, interval - elapsed)
-            time.sleep(sleep_t)
+        try:
+            while self._running:
+                start = time.monotonic()
+                if self._force_reconnect:
+                    self._force_reconnect = False
+                    self._disconnect()
+                    self._prev_status = None
+                    self._temperature_alarm = False
+                    self._device_info = UPSStatus()
+                    self._demo_mode = False
+                    self._retry_count = 0
+                    self._connect()
+                self._poll_once()
+                interval = self.config["connection"]["poll_interval"] / 1000.0
+                self._wake.wait(max(0.1, interval - (time.monotonic() - start)))
+                self._wake.clear()
+        finally:
+            self._disconnect()
 
     def stop(self):
         self._running = False
-        self._disconnect()
+        self._wake.set()
 
     def request_reconnect(self):
-        """Вызвать из основного потока для принудительного переподключения."""
         self._force_reconnect = True
+        self._wake.set()
 
     # ── Диагностика: кто держит порт ────────────────────────────────────────
     @staticmethod
@@ -1243,6 +1243,9 @@ class UPSPollerThread(QThread):
 
     # ── Подключение ──────────────────────────────────────────────────────────
     def _connect(self):
+        if self.config["connection"]["type"] == "snmp":
+            self._demo_mode = False
+            return
         if not SERIAL_AVAILABLE:
             self._demo_mode = True
             self.event_occurred.emit(EventRecord(
@@ -1258,11 +1261,11 @@ class UPSPollerThread(QThread):
         try:
             self._serial = serial.Serial(
                 port     = port,
-                baudrate = MEGATEC_BAUD,
+                baudrate = conn.get("baud", MEGATEC_BAUD),
                 bytesize = MEGATEC_DATABITS,
                 stopbits = MEGATEC_STOPBITS,
                 parity   = MEGATEC_PARITY,
-                timeout  = MEGATEC_TIMEOUT
+                timeout  = conn.get("timeout", MEGATEC_TIMEOUT)
             )
 
             # Запросить информацию об устройстве
@@ -1274,10 +1277,10 @@ class UPSPollerThread(QThread):
             if resp:
                 self.parser.parse_f(resp, status)
 
-            self._was_connected  = True
+            self._device_info = status
+            self._was_connected  = False  # only a valid Q1 confirms connection
             self._demo_mode      = False
             self._retry_count    = 0
-            self.connected.emit()
             self.event_occurred.emit(
                 EventRecord("INFO",
                     f"✅ Подключено к {port} | {status.company} {status.model} "
@@ -1345,6 +1348,7 @@ class UPSPollerThread(QThread):
             except Exception:
                 pass
         self._serial = None
+        self._was_connected = False
 
     # ── Отправка команды ─────────────────────────────────────────────────────
     def _send_command(self, cmd: str) -> Optional[str]:
@@ -1357,7 +1361,7 @@ class UPSPollerThread(QThread):
                 self._serial.write((cmd + '\r').encode('ascii'))
                 self._serial.flush()
                 time.sleep(0.1)
-                resp = self._serial.readline().decode('ascii', errors='ignore')
+                resp = self._serial.read_until(b'\r').decode('ascii', errors='ignore')
                 return resp.strip()
             except Exception as e:
                 return None
@@ -1374,9 +1378,24 @@ class UPSPollerThread(QThread):
 
     def _poll_once(self):
         self._poll_cycle += 1
-        status = UPSStatus()
+        status = copy.deepcopy(self._device_info)
+        status.connected = False
 
-        if self._demo_mode:
+        if self.config["connection"]["type"] == "snmp":
+            try:
+                for key, value in read_ups(self.config["connection"]).items():
+                    setattr(status, key, value)
+                status.connected = True
+                status.timestamp = datetime.now()
+                if not self._was_connected:
+                    self._was_connected = True
+                    self.connected.emit()
+            except Exception as exc:
+                if self._was_connected or self._poll_cycle == 1:
+                    self.event_occurred.emit(EventRecord("CRITICAL", f"SNMP: {exc}"))
+                    self.connection_lost.emit()
+                self._was_connected = False
+        elif self._demo_mode:
             # Периодически пробуем выйти из демо-режима и подключиться к реальному ИБП
             if self._poll_cycle % self._AUTO_RETRY_CYCLES == 0:
                 self._disconnect()
@@ -1420,8 +1439,9 @@ class UPSPollerThread(QThread):
                 return
 
         # Генерация событий при изменении состояния
-        self._detect_events(status)
-        self._prev_status = status
+        if status.connected and not self._demo_mode:
+            self._detect_events(status)
+            self._prev_status = status
         self.status_updated.emit(status)
 
     # ── Демо-режим ───────────────────────────────────────────────────────────
@@ -1459,40 +1479,48 @@ class UPSPollerThread(QThread):
 
     # ── Детектор событий ─────────────────────────────────────────────────────
     def _detect_events(self, curr: UPSStatus):
-        if not self._prev_status:
+        if not curr.connected:
             return
         prev = self._prev_status
-
-        if curr.utility_fail and not prev.utility_fail:
-            self.event_occurred.emit(EventRecord(
-                "CRITICAL", "⚡ Сбой сетевого питания — ИБП перешёл на батарею",
-                {"input_v": curr.input_voltage}
-            ))
-        elif not curr.utility_fail and prev.utility_fail:
-            self.event_occurred.emit(EventRecord(
-                "INFO", "✅ Сетевое питание восстановлено",
-                {"input_v": curr.input_voltage}
-            ))
-
-        if curr.battery_low and not prev.battery_low:
-            self.event_occurred.emit(EventRecord(
-                "CRITICAL", f"🔋 Низкий заряд батареи: {curr.battery_charge}%",
-                {"charge": curr.battery_charge, "voltage": curr.battery_voltage}
-            ))
-
-        if curr.temperature > 45.0 and (not prev or prev.temperature <= 45.0):
-            self.event_occurred.emit(EventRecord(
-                "WARNING", f"🌡️ Высокая температура: {curr.temperature:.1f}°C"
-            ))
-
-        if curr.bypass_active and not prev.bypass_active:
-            self.event_occurred.emit(EventRecord(
-                "WARNING", "⚠️ Активирован режим AVR/Bypass"
-            ))
+        if curr.utility_fail and (prev is None or not prev.utility_fail):
+            self.event_occurred.emit(EventRecord("CRITICAL",
+                "⚡ Сбой сетевого питания — ИБП перешёл на батарею",
+                {"alert": "utility_fail", "input_v": curr.input_voltage}))
+        elif prev is not None and not curr.utility_fail and prev.utility_fail:
+            self.event_occurred.emit(EventRecord("INFO", "✅ Сетевое питание восстановлено"))
+        if curr.battery_low and (prev is None or not prev.battery_low):
+            self.event_occurred.emit(EventRecord("CRITICAL",
+                f"🔋 Низкий заряд батареи: {curr.battery_charge}%", {"alert": "battery_low"}))
+        threshold = float(self.config["alerts"]["temp_threshold"])
+        if threshold != self._temperature_threshold:
+            self._temperature_alarm = False
+            self._temperature_threshold = threshold
+        if curr.temperature >= threshold and not self._temperature_alarm:
+            self._temperature_alarm = True
+            self.event_occurred.emit(EventRecord("WARNING",
+                f"🌡️ Высокая температура: {curr.temperature:.1f}°C (порог {threshold:g}°C)",
+                {"alert": "temp_high"}))
+        elif curr.temperature <= threshold - 2.0:
+            self._temperature_alarm = False
+        if curr.bypass_active and (prev is None or not prev.bypass_active):
+            self.event_occurred.emit(EventRecord("WARNING", "⚠️ Активирован режим AVR/Bypass"))
+        if curr.ups_failed and (prev is None or not prev.ups_failed):
+            self.event_occurred.emit(EventRecord("CRITICAL", "⛔ ИБП сообщает о неисправности"))
 
     # ── Команды управления ────────────────────────────────────────────────────
+    def _can_control(self):
+        if self.config["connection"]["type"] == "snmp":
+            self.event_occurred.emit(EventRecord("WARNING", "Команды управления ИБП доступны только через COM-порт."))
+            return False
+        if not self._demo_mode and not self._was_connected:
+            self.event_occurred.emit(EventRecord("WARNING", "Команда не отправлена: нет подтверждённой связи с ИБП."))
+            return False
+        return True
+
     def send_test_short(self):
         """Тест 10 секунд (команда T)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             self.event_occurred.emit(EventRecord("ACTION", "Тест батареи (10 сек) — демо режим"))
             return
@@ -1501,6 +1529,8 @@ class UPSPollerThread(QThread):
 
     def send_test_long(self):
         """Тест до разряда (команда TL)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             self.event_occurred.emit(EventRecord("ACTION", "Длинный тест батареи — демо режим"))
             return
@@ -1509,6 +1539,8 @@ class UPSPollerThread(QThread):
 
     def send_test_cancel(self):
         """Отмена теста (команда CT)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             return
         self._send_command("CT")
@@ -1516,6 +1548,8 @@ class UPSPollerThread(QThread):
 
     def send_shutdown(self, minutes: float = 5.0):
         """Выключить выход ИБП через N минут (команда S<n>)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             self.event_occurred.emit(EventRecord("ACTION", f"Команда выключения через {minutes} мин — демо"))
             return
@@ -1525,6 +1559,8 @@ class UPSPollerThread(QThread):
 
     def send_shutdown_restore(self, off_min: float, on_min: int):
         """Выключить и восстановить (команда S<n>R<m>)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             return
         n = f"{off_min:.1f}" if off_min < 1 else str(int(off_min))
@@ -1534,6 +1570,8 @@ class UPSPollerThread(QThread):
 
     def send_cancel_shutdown(self):
         """Отмена команды выключения (команда C)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             return
         self._send_command("C")
@@ -1541,6 +1579,8 @@ class UPSPollerThread(QThread):
 
     def send_toggle_beeper(self):
         """Переключить пищалку (команда Q)."""
+        if not self._can_control():
+            return
         if self._demo_mode:
             return
         self._send_command("Q")
@@ -1865,7 +1905,7 @@ class PowerFlowWidget(QWidget):
 
         p.setPen(QColor(mode_col))
         p.setFont(QFont("Segoe UI", max(7, int(H * 0.09)), QFont.Bold))
-        p.drawText(QRectF(0, H * 0.88, W, H * 0.12),
+        p.drawText(QRectF(W * 0.65, H * 0.78, W * 0.35, H * 0.22),
                    Qt.AlignCenter, mode_txt)
 
 
@@ -2094,7 +2134,20 @@ class DashboardTab(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #0D1117; } "
+                            "QScrollBar:vertical { background: #161B22; width: 12px; } "
+                            "QScrollBar::handle:vertical { background: #30363D; min-height: 30px; }")
+        inner = QWidget()
+        inner.setObjectName("dashboardContent")
+        inner.setStyleSheet("QWidget#dashboardContent { background: #0D1117; }")
+        root = QVBoxLayout(inner)
+        root.setSizeConstraint(QLayout.SetMinimumSize)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
@@ -2133,7 +2186,7 @@ class DashboardTab(QWidget):
         self.card_output_v  = ValueCard("Выход", "В")
         self.card_freq      = ValueCard("Частота", "Гц")
         self.card_watts     = ValueCard("Нагрузка", "Вт")
-        self.card_runtime   = ValueCard("Автономия", "мин")
+        self.card_runtime   = ValueCard("Автономия (оценка)", "мин")
         self.card_temp      = ValueCard("Температура", "°C")
         self.card_batt_v    = ValueCard("Батарея", "В")
 
@@ -2314,9 +2367,11 @@ class DashboardTab(QWidget):
         self.card_runtime.setValue(s.runtime_min, 0,
             THEME["fault"] if s.runtime_min < 5 else
             THEME["battery"] if s.runtime_min < 10 else THEME["accent3"])
-        self.card_temp.setValue(s.temperature, 1,
-            THEME["fault"] if s.temperature > 50 else
-            THEME["battery"] if s.temperature > 40 else THEME["accent3"])
+        threshold = self.window().config["alerts"]["temp_threshold"]
+        self.card_runtime.setToolTip("Оценка по напряжению и нагрузке для Q1; значение UPS MIB для SNMP. Не гарантированное время работы.")
+        self.card_temp.setValue(s.temperature if math.isfinite(s.temperature) else "—", 1,
+            THEME["fault"] if s.temperature >= threshold else
+            THEME["battery"] if s.temperature >= threshold - 2 else THEME["accent3"])
         # Батарея: показываем суммарное В, tooltip — формат и ячейки
         batt_total = s.battery_voltage_total
         batt_cell  = s.battery_voltage_per_cell
@@ -2339,9 +2394,11 @@ class DashboardTab(QWidget):
                   THEME["battery"] if s.output_load_pct > 70 else THEME["accent3"])
         self.gauge_load.setValue(s.output_load_pct, load_c)
 
-        temp_c = (THEME["fault"] if s.temperature > 50 else
-                  THEME["battery"] if s.temperature > 40 else THEME["accent2"])
-        self.gauge_temp.setValue(s.temperature, temp_c)
+        temp_c = (THEME["fault"] if s.temperature >= threshold else
+                  THEME["battery"] if s.temperature >= threshold - 2 else THEME["accent2"])
+        self.gauge_temp.setVisible(math.isfinite(s.temperature))
+        if math.isfinite(s.temperature):
+            self.gauge_temp.setValue(s.temperature, temp_c)
 
         # Полосы
         self.bar_input_v.setValue(s.input_voltage)
@@ -2367,7 +2424,11 @@ class DashboardTab(QWidget):
                 self.bar_batt_v.max_val = mods * 13.50
                 self.bar_batt_v.label   = "Напряжение батареи"
                 self.bar_batt_v.setValue(bv)
-        self.bar_temp.setValue(s.temperature)
+        self.bar_temp.crit = threshold / self.bar_temp.max_val * 100
+        self.bar_temp.warn = (threshold - 2) / self.bar_temp.max_val * 100
+        self.bar_temp.setVisible(math.isfinite(s.temperature))
+        if math.isfinite(s.temperature):
+            self.bar_temp.setValue(s.temperature)
 
         # Флаги
         flag_map = {
@@ -2640,7 +2701,7 @@ class SettingsTab(QWidget):
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
-        self.config = config
+        self.config = copy.deepcopy(config)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -3040,7 +3101,7 @@ class SettingsTab(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(scroll)
-        self._on_type_changed(0)
+        self._on_type_changed(self.cb_type.currentIndex())
 
     def _kill_port(self):
         """Освободить занятый COM-порт — завершить удерживающие его процессы."""
@@ -3200,21 +3261,37 @@ class SettingsTab(QWidget):
         self.config["alerts"]["log_file"]       = self.chk_al_log.isChecked()
         self.config["alerts"]["temp_threshold"] = self.spin_temp_thr.value()
 
-        self.config_changed.emit(self.config)
-
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
+            self.config_changed.emit(copy.deepcopy(self.config))
             QMessageBox.information(self, "Настройки", "Настройки сохранены.")
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить: {e}")
 
     def _reset(self):
-        r = QMessageBox.question(self, "Сброс",
-                                 "Сбросить настройки к значениям по умолчанию?")
-        if r == QMessageBox.Yes:
-            self.config.update(DEFAULT_CONFIG)
-            self._save()
+        if QMessageBox.question(self, "Сброс", "Сбросить настройки к значениям по умолчанию?") != QMessageBox.Yes:
+            return
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
+        conn, sd, alerts = (self.config[key] for key in ("connection", "shutdown", "alerts"))
+        self.cb_type.setCurrentIndex(0)
+        if self.cb_port.findText(conn["port"]) < 0:
+            self.cb_port.addItem(conn["port"])
+        self.cb_port.setCurrentText(conn["port"])
+        self.spin_poll.setValue(conn["poll_interval"])
+        self.ed_snmp_host.setText(conn["snmp_host"])
+        self.ed_snmp_comm.setText(conn["snmp_community"])
+        for widget, key in ((self.chk_sd_enabled, "enabled"), (self.chk_bs_enabled, "on_battery_switch")):
+            widget.setChecked(sd[key])
+        for widget, key in ((self.spin_sd_low, "battery_low_percent"), (self.spin_sd_delay, "delay_minutes"),
+                            (self.spin_sd_warn, "warn_before_sec"), (self.spin_bs_delay, "on_battery_switch_delay_sec")):
+            widget.setValue(sd[key])
+        for widget, key in ((self.chk_al_batt, "battery_low"), (self.chk_al_fail, "utility_fail"),
+                            (self.chk_al_temp, "temp_high"), (self.chk_al_sound, "sound"),
+                            (self.chk_al_popup, "popup"), (self.chk_al_log, "log_file")):
+            widget.setChecked(alerts[key])
+        self.spin_temp_thr.setValue(alerts["temp_threshold"])
+        self._save()
 
     @staticmethod
     def _combo_style():
@@ -3338,10 +3415,12 @@ class EventLogTab(QWidget):
         filter_row.addWidget(self.filter_ed)
         root.addLayout(filter_row)
 
-    def add_event(self, event: EventRecord):
+    def add_event(self, event: EventRecord, log_file: bool = True):
         self._events.append(event)
         self._add_row(event)
         # CSV лог
+        if not log_file:
+            return
         try:
             with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
@@ -3410,6 +3489,21 @@ class EventLogTab(QWidget):
 # ═════════════════════════════════════════════════════════════════════════════
 #  ВКЛАДКА: SNMP
 # ═════════════════════════════════════════════════════════════════════════════
+
+class SNMPQueryThread(QThread):
+    result_ready = pyqtSignal(str)
+
+    def __init__(self, host, community, oid, port=161, parent=None):
+        super().__init__(parent)
+        self.args = (host, community, [oid], port)
+
+    def run(self):
+        try:
+            result = snmp_get(*self.args)
+            self.result_ready.emit("\n".join(f"{key} = {value}" for key, value in result.items()))
+        except Exception as exc:
+            self.result_ready.emit(f"Ошибка SNMP: {exc}")
+
 
 class SNMPTab(QWidget):
     def __init__(self, config: dict, parent=None):
@@ -3511,7 +3605,7 @@ class SNMPTab(QWidget):
             ("Входное напряжение (В)",  SNMP_OID_INPUT_VOLTAGE),
             ("Выходное напряжение (В)", SNMP_OID_OUTPUT_VOLTAGE),
             ("Нагрузка (%)",           SNMP_OID_LOAD_PERCENT),
-            ("Время автономии (сек)",  SNMP_OID_BATT_RUNTIME),
+            ("Время автономии (мин)",  SNMP_OID_BATT_RUNTIME),
             ("Число аварий",           SNMP_OID_ALARMS_PRESENT),
         ]), 2)
         oid_table.setHorizontalHeaderLabels(["Параметр", "OID"])
@@ -3542,7 +3636,7 @@ class SNMPTab(QWidget):
             ("Входное напряжение (В)",  SNMP_OID_INPUT_VOLTAGE),
             ("Выходное напряжение (В)", SNMP_OID_OUTPUT_VOLTAGE),
             ("Нагрузка (%)",           SNMP_OID_LOAD_PERCENT),
-            ("Время автономии (сек)",  SNMP_OID_BATT_RUNTIME),
+            ("Время автономии (мин)",  SNMP_OID_BATT_RUNTIME),
             ("Число аварий",           SNMP_OID_ALARMS_PRESENT),
         ]):
             oid_table.setItem(i, 0, QTableWidgetItem(name))
@@ -3556,34 +3650,16 @@ class SNMPTab(QWidget):
         root.addStretch()
 
     def _do_snmp_get(self):
-        if not SNMP_AVAILABLE:
-            self.result_text.setPlainText(
-                "Ошибка: pysnmp не установлен.\nВыполните: pip install pysnmp")
+        if getattr(self, "_worker", None) is not None and self._worker.isRunning():
             return
-        host  = self.ed_host.text()
-        comm  = self.ed_comm.text()
-        oid   = self.ed_oid.text()
-        self.result_text.setPlainText(f"Запрос к {host}:{comm} OID {oid}...\n")
-        try:
-            iterator = getCmd(
-                SnmpEngine(),
-                CommunityData(comm, mpModel=0),
-                UdpTransportTarget((host, 161), timeout=3, retries=1),
-                ContextData(),
-                ObjectType(ObjectIdentity(oid))
-            )
-            errInd, errStatus, errIdx, varBinds = next(iterator)
-            if errInd:
-                self.result_text.setPlainText(f"Ошибка SNMP: {errInd}")
-            elif errStatus:
-                self.result_text.setPlainText(
-                    f"SNMP errStatus {errStatus.prettyPrint()} at {varBinds[int(errIdx)-1][0]}")
-            else:
-                lines = [f"{name.prettyPrint()} = {val.prettyPrint()}"
-                         for name, val in varBinds]
-                self.result_text.setPlainText("\n".join(lines))
-        except Exception as e:
-            self.result_text.setPlainText(f"Исключение: {e}")
+        if not SNMP_AVAILABLE:
+            self.result_text.setPlainText("SNMP недоступен: установите pysnmp>=7.1,<8")
+            return
+        self.result_text.setPlainText("Выполняется SNMP-запрос…")
+        self._worker = SNMPQueryThread(self.ed_host.text(), self.ed_comm.text(),
+            self.ed_oid.text(), self.config["connection"].get("snmp_port", 161), self)
+        self._worker.result_ready.connect(self.result_text.setPlainText)
+        self._worker.start()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3927,7 +4003,8 @@ class MainWindow(QMainWindow):
         self.poller.port_error.connect(self._on_port_error)
         self.poller.start()
         self.tab_events.add_event(
-            EventRecord("INFO", f"Запуск {APP_NAME} v{APP_VERSION}"))
+            EventRecord("INFO", f"Запуск {APP_NAME} v{APP_VERSION}"),
+            self.config["alerts"].get("log_file", True))
 
     def _refresh_header_ports(self):
         """Обновить выпадающий список портов в заголовке."""
@@ -3967,7 +4044,7 @@ class MainWindow(QMainWindow):
         if port_data:
             self.config["connection"]["port"] = port_data
             if self.poller:
-                self.poller.config = self.config
+                self.poller.config = copy.deepcopy(self.config)
 
         self.btn_connect.setEnabled(False)
         self.btn_connect.setText("⏳  Подключение...")
@@ -4058,10 +4135,13 @@ class MainWindow(QMainWindow):
         self._refresh_header_ports()
 
     def _on_status(self, s: UPSStatus):
-        self.tab_dash.update_status(s)
+        if s.connected:
+            self.tab_dash.update_status(s)
+        else:
+            self.tab_dash.power_flow.set_disconnected()
         self._update_tray_icon(s)
         self.lbl_conn_state.setText(
-            f"{'●' if s.connected else '○'}  {s.mode_string()}"
+            f"●  {s.mode_string()}" if s.connected else "○  Нет достоверных данных"
         )
         self.lbl_conn_state.setStyleSheet(
             f"color:{s.mode_color() if s.connected else THEME['text_sec']}; font:8pt 'Segoe UI';"
@@ -4069,21 +4149,35 @@ class MainWindow(QMainWindow):
         # Показать/скрыть метку демо-режима
         dm = getattr(self.poller, '_demo_mode', False)
         self.lbl_demo.setText("⚙  ДЕМО-РЕЖИМ" if dm else "")
-        self._check_auto_shutdown(s)
+        if not dm:
+            self._check_auto_shutdown(s)
 
     def _on_event(self, event: EventRecord):
-        self.tab_events.add_event(event)
+        self.tab_events.add_event(event, self.config["alerts"].get("log_file", True))
         # Обновить счётчик на вкладке
         cnt = self.tab_events.table.rowCount()
         self.tabs.setTabText(3, f"📋  Журнал ({cnt})")
 
-        # Windows всплывающее уведомление
-        if (self.config["alerts"].get("popup", True) and
-                event.level in ("CRITICAL", "WARNING") and
-                hasattr(self, 'tray_icon')):
-            icon = (QSystemTrayIcon.Critical if event.level == "CRITICAL"
-                    else QSystemTrayIcon.Warning)
-            self.tray_icon.showMessage(APP_NAME, event.message, icon, 5000)
+        alert = event.data.get("alert")
+        if alert and not self.config["alerts"].get(alert, True):
+            return
+        if event.level not in ("CRITICAL", "WARNING"):
+            return
+        sound = self.config["alerts"].get("sound", True)
+        if self.config["alerts"].get("popup", True):
+            shown = show_notification(int(self.winId()), APP_NAME, event.message,
+                                      event.level == "CRITICAL", sound)
+            if shown:
+                if not hasattr(self, "_notification_timer"):
+                    self._notification_timer = QTimer(self)
+                    self._notification_timer.setSingleShot(True)
+                    self._notification_timer.timeout.connect(lambda: remove_notification(int(self.winId())))
+                self._notification_timer.start(12000)
+                return
+            # Native shell unavailable: display a non-modal, silent in-app warning.
+            self.statusBar().showMessage(event.message, 10000)
+        if sound:
+            QApplication.beep()
 
     def _on_conn_lost(self):
         self.lbl_status_bar.setText("🔴  Связь с ИБП потеряна")
@@ -4092,7 +4186,8 @@ class MainWindow(QMainWindow):
         self.tab_dash.power_flow.set_disconnected()
 
     def _on_connected(self):
-        port = self.config["connection"]["port"]
+        conn = self.config["connection"]
+        port = conn["snmp_host"] if conn["type"] == "snmp" else conn["port"]
         dm   = getattr(self.poller, '_demo_mode', False)
         txt  = "⚙  Демо-режим (нет порта)" if dm else f"🟢  Подключено: {port}"
         self.lbl_status_bar.setText(txt)
@@ -4111,53 +4206,38 @@ class MainWindow(QMainWindow):
         self._sd_phase      = 0    # 0=ожидание  1=отсчёт  2=выполнено
         self._sd_countdown  = 0    # секунд до завершения
         self._sd_trigger    = ""   # "battery_switch" | "battery_low"
-        self._sd_warned_at  = -1   # последний показанный порог предупреждения
+        self._sd_warned_at  = -1
+        self._sd_suppressed = False
+        self._sd_deadline = 0.0
+        self._sd_windows_pending = False
 
     # ── Проверка триггеров (вызывается каждые 2 сек из _on_status) ────────────
     def _check_auto_shutdown(self, s: UPSStatus):
+        if not s.connected:
+            return  # unknown power state must not cancel an existing countdown
         sd = self.config["shutdown"]
-
-        # ── Отмена при восстановлении питания ──
-        if not s.utility_fail and self._sd_phase == 1:
-            self._sd_phase     = 0
-            self._sd_countdown = 0
-            self._sd_trigger   = ""
-            self._sd_warned_at = -1
-            self._hide_countdown_banner()
-            self._on_event(EventRecord(
-                "INFO", "✅ Автозавершение отменено — сетевое питание восстановлено"))
+        if not s.utility_fail:
+            if self._sd_phase in (1, 2):
+                if not self._cancel_auto_shutdown(manual=False):
+                    return
+            self._sd_suppressed = False
             return
-
-        if self._sd_phase != 0:
-            return   # отсчёт уже идёт или завершён — не перезапускаем
-
-        # ── Триггер 1: переключение на батарею (on_battery_switch) ──
-        if sd.get("on_battery_switch", False) and s.utility_fail:
-            delay_sec = int(sd.get("on_battery_switch_delay_sec", 120))
-            self._arm_shutdown(
-                trigger  = "battery_switch",
-                delay_sec= delay_sec,
-                reason   = (f"⚡ ИБП перешёл на батарею. "
-                            f"Завершение работы через {_fmt_sec(delay_sec)}.")
-            )
+        if self._sd_phase != 0 or self._sd_suppressed:
             return
-
-        # ── Триггер 2: низкий заряд батареи (legacy) ──
-        if sd.get("enabled", False) and s.utility_fail:
-            threshold = sd.get("battery_low_percent", 30)
-            if s.battery_charge < threshold:
-                delay_sec = int(sd.get("delay_minutes", 5) * 60)
-                self._arm_shutdown(
-                    trigger  = "battery_low",
-                    delay_sec= delay_sec,
-                    reason   = (f"🔋 Заряд батареи {s.battery_charge}% < {threshold}%. "
-                                f"Завершение работы через {_fmt_sec(delay_sec)}.")
-                )
+        if sd.get("on_battery_switch", False):
+            delay = int(sd.get("on_battery_switch_delay_sec", 120))
+            self._arm_shutdown("battery_switch", delay,
+                f"⚡ ИБП перешёл на батарею. Завершение работы через {_fmt_sec(delay)}.")
+        elif sd.get("enabled", False) and (s.battery_low or s.battery_charge <= sd.get("battery_low_percent", 30)):
+            delay = int(sd.get("delay_minutes", 5) * 60)
+            self._arm_shutdown("battery_low", delay,
+                f"🔋 Низкий заряд батареи ({s.battery_charge}%). Завершение через {_fmt_sec(delay)}.")
 
     def _arm_shutdown(self, trigger: str, delay_sec: int, reason: str):
         """Запустить отсчёт завершения работы."""
         self._sd_phase     = 1
         self._sd_countdown = max(0, delay_sec)
+        self._sd_deadline = time.monotonic() + self._sd_countdown
         self._sd_trigger   = trigger
         self._sd_warned_at = -1
         self._on_event(EventRecord("CRITICAL", f"🚨 {reason}"))
@@ -4171,54 +4251,58 @@ class MainWindow(QMainWindow):
     def _auto_shutdown_tick(self):
         if self._sd_phase != 1:
             return
-
-        self._sd_countdown -= 1
+        self._sd_countdown = max(0, math.ceil(self._sd_deadline - time.monotonic()))
         self._update_countdown_banner(self._sd_countdown)
-
-        # Предупреждения в журнале на ключевых отметках
-        for mark in (300, 120, 60, 30, 10):
-            if self._sd_countdown == mark and self._sd_warned_at != mark:
-                self._sd_warned_at = mark
-                self._on_event(EventRecord(
-                    "CRITICAL",
-                    f"⚠️ Завершение работы через {_fmt_sec(self._sd_countdown)}!"))
-                if hasattr(self, 'tray_icon'):
-                    self.tray_icon.showMessage(
-                        APP_NAME,
-                        f"Завершение работы через {_fmt_sec(self._sd_countdown)}!\n"
-                        "Нажмите «Отменить» в окне программы для отмены.",
-                        QSystemTrayIcon.Critical, 8000)
-                break
-
+        mark = int(self.config["shutdown"].get("warn_before_sec", 60))
+        if 0 < self._sd_countdown <= mark and self._sd_warned_at != mark:
+            self._sd_warned_at = mark
+            self._on_event(EventRecord("CRITICAL",
+                f"⚠️ Завершение работы через {_fmt_sec(self._sd_countdown)}! Можно отменить в окне программы."))
         if self._sd_countdown <= 0:
             self._execute_shutdown()
 
     def _execute_shutdown(self):
-        """Выполнить команду завершения работы."""
-        self._sd_phase = 2
-        self._hide_countdown_banner()
         cmd = self.config["shutdown"]["command"]
+        self._sd_phase = 2
         self._on_event(EventRecord("ACTION", f"💻 Выполнение команды: {cmd}"))
         try:
-            subprocess.run(cmd, shell=True)
-        except Exception as e:
-            self._on_event(EventRecord("CRITICAL", f"Ошибка команды завершения: {e}"))
+            result = subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
+            if result.returncode:
+                raise RuntimeError(f"код возврата {result.returncode}")
+            self._sd_windows_pending = bool(re.search(r"(?i)\bshutdown(?:\.exe)?\b", cmd))
+            if self._sd_windows_pending:
+                self._show_countdown_banner(0)
+                self._countdown_lbl.setText("⚠ Команда выключения передана Windows — можно отменить")
+            else:
+                self._hide_countdown_banner()
+        except Exception as exc:
+            self._sd_phase = 0
+            self._sd_suppressed = True
+            self._hide_countdown_banner()
+            self._on_event(EventRecord("CRITICAL", f"Ошибка команды завершения: {exc}"))
 
-    def _cancel_auto_shutdown(self):
-        """Отмена обратного отсчёта вручную (кнопка «Отменить»)."""
-        if self._sd_phase != 1:
-            return
-        self._sd_phase     = 0
+    def _cancel_auto_shutdown(self, checked=False, manual=True):
+        if self._sd_phase not in (1, 2):
+            return True
+        if self._sd_windows_pending:
+            try:
+                result = subprocess.run(["shutdown", "/a"], timeout=5, capture_output=True)
+                # ERROR_NO_SHUTDOWN_IN_PROGRESS: command has already been cancelled.
+                if result.returncode not in (0, 1116):
+                    raise RuntimeError(f"код возврата {result.returncode}")
+            except Exception as exc:
+                self._on_event(EventRecord("CRITICAL", f"Не удалось отменить выключение Windows: {exc}"))
+                return False
+        self._sd_windows_pending = False
+        self._sd_phase = 0
         self._sd_countdown = 0
-        self._sd_trigger   = ""
+        self._sd_trigger = ""
         self._sd_warned_at = -1
+        self._sd_suppressed = manual
         self._hide_countdown_banner()
-        # Отменить команду shutdown Windows если она уже была запущена
-        try:
-            subprocess.run("shutdown /a", shell=True, timeout=3)
-        except Exception:
-            pass
-        self._on_event(EventRecord("INFO", "🛑 Автозавершение отменено вручную"))
+        self._on_event(EventRecord("INFO", "🛑 Автозавершение отменено вручную" if manual else
+                                  "✅ Автозавершение отменено — сетевое питание восстановлено"))
+        return True
 
     # ── Баннер обратного отсчёта в заголовке ─────────────────────────────────
     def _show_countdown_banner(self, seconds: int):
@@ -4293,9 +4377,23 @@ class MainWindow(QMainWindow):
 
     # ── Конфиг ───────────────────────────────────────────────────────────────
     def _on_config_changed(self, new_config: dict):
-        self.config.update(new_config)
+        old_conn = self.config["connection"]
+        new_conn = new_config["connection"]
+        reconnect = any(old_conn.get(key) != new_conn.get(key) for key in
+                        ("type", "port", "baud", "timeout", "snmp_host", "snmp_community", "snmp_port"))
+        self.config = copy.deepcopy(new_config)
+        self.tab_snmp.config = copy.deepcopy(self.config)
+        self.tab_snmp.ed_host.setText(new_conn["snmp_host"])
+        self.tab_snmp.ed_comm.setText(new_conn["snmp_community"])
         if self.poller:
-            self.poller.config = self.config
+            self.poller.config = copy.deepcopy(self.config)
+            self.poller._wake.set()
+            if reconnect:
+                self.poller.request_reconnect()
+        if self._sd_phase == 1:
+            key = "on_battery_switch" if self._sd_trigger == "battery_switch" else "enabled"
+            if not self.config["shutdown"].get(key, False):
+                self._cancel_auto_shutdown()
 
     # ── Часы ─────────────────────────────────────────────────────────────────
     def _update_clock(self):
@@ -4316,9 +4414,12 @@ class MainWindow(QMainWindow):
             event.accept()
 
     def _cleanup(self):
+        remove_notification(int(self.winId()))
         if self.poller:
             self.poller.stop()
-            self.poller.wait(3000)
+            self.poller.wait()  # stop wakes sleep; serial/SNMP calls have bounded timeouts
+        if hasattr(self.tab_snmp, "_worker") and self.tab_snmp._worker is not None:
+            self.tab_snmp._worker.wait()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -4338,6 +4439,9 @@ def load_config() -> dict:
                     config[section].update(vals)
         except Exception:
             pass
+    legacy = 'shutdown /s /t 60 /c "ИБП: питание от батареи. Завершение работы."'
+    if config["shutdown"].get("command") == legacy:
+        config["shutdown"]["command"] = DEFAULT_CONFIG["shutdown"]["command"]
     return config
 
 
@@ -4357,6 +4461,13 @@ def main():
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("ExeGate")
     app.setStyle("Fusion")
+
+    if "--self-test" in sys.argv:
+        from smoke_test import run
+        index = sys.argv.index("--self-test")
+        if index + 1 >= len(sys.argv):
+            raise SystemExit("--self-test requires an output JSON path")
+        raise SystemExit(run(sys.modules[__name__], sys.argv[index + 1]))
 
     config = load_config()
 

@@ -1,0 +1,35 @@
+name: Test and build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python -m PyInstaller ExeGate_UPS_Manager.spec --noconfirm --clean
+      - name: Test packaged executable
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $process = Start-Process -FilePath 'dist/ExeGate_PowerExpert_Manager.exe' -ArgumentList '--self-test', 'dist/smoke.json' -PassThru -Wait -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Packaged self-test failed" }
+          $result = Get-Content dist/smoke.json | ConvertFrom-Json
+          if ($result.status -ne 'passed') { throw "Packaged self-test failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ExeGate-PowerExpert-Manager-Windows-x64
+          path: |
+            dist/ExeGate_PowerExpert_Manager.exe
+            dist/smoke.json
+            dist/smoke.png
